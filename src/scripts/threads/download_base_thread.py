@@ -14,22 +14,45 @@ from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
 from config import *
+import edge_routes
 from search_index import translation_index
 
 _PARALLEL_THRESHOLD = 2 * 1024 * 1024  # skip parallel for files < 2 MB
 _DOWNLOAD_TIMEOUT = (10, 30)  # the read timeout is also what notices a connection that was dropped silently
+_PINNED_TIMEOUT = (5, 30)  # a picked IP that doesn't answer fails fast, and another route takes over
+# One connection and one range per MB, up to these
+_MAX_WORKERS = 12
+_MAX_UNITS = 48
+_PIECE = 16 * 1024  # small pieces keep progress and handoffs responsive on slow lines
+_STEAL_MIN_BYTES = 64 * 1024  # a range with less left finishes where it is
 
 
-def create_http_session():
+class _Handoff(Exception):
+    """A slow range's rest taken over by a faster idle worker at the end."""
+
+
+def create_http_session(pinned=False):
     """A session that retries transient failures. Use one per download: a connection left idle for
-    later can be dropped silently by NATs and firewalls, and reusing it stalls for a whole read timeout."""
-    retry = Retry(total=3, backoff_factor=0.5, backoff_jitter=0.5, status_forcelist=RETRY_STATUSES,
-                  allowed_methods=frozenset({"GET"}), raise_on_status=False, respect_retry_after_header=False)
+    later can be dropped silently by NATs and firewalls, and reusing it stalls for a whole read timeout.
+    A pinned session only retries error statuses: for a connection problem, another route is the better retry."""
+    retry = Retry(
+        total=3, connect=0 if pinned else None, read=0 if pinned else None, backoff_factor=0.5, backoff_jitter=0.5,
+        status_forcelist=RETRY_STATUSES, allowed_methods=frozenset({"GET"}), raise_on_status=False, respect_retry_after_header=False
+    )
     adapter = HTTPAdapter(max_retries=retry, pool_maxsize=16)
     session = requests.Session()
     session.mount("https://", adapter)
     session.mount("http://", adapter)
     return session
+
+
+def _timeout(route):
+    return _PINNED_TIMEOUT if route != "dns" else _DOWNLOAD_TIMEOUT
+
+
+def _etag(resp):
+    """The response's ETag, weak or strong alike."""
+    return (resp.headers.get('ETag') or '').removeprefix('W/')
 
 
 class DownloadBaseThread(QThread):
@@ -60,12 +83,36 @@ class DownloadBaseThread(QThread):
         except OSError:
             pass  # no readable local copy, so the file is downloaded in full
 
+        # Server-picked routes (China only); None downloads as before
+        plan = edge_routes.plan_for(url)
+        host = urlparse(url).hostname
+        first_route = plan["exploit"][0] if plan else "dns"
+        failed_routes = set()
+
         # Connections are reused across this download's ranges, but never left idle for the next download
-        with create_http_session() as session:
+        session = create_http_session(pinned=first_route != "dns")
+        try:
             req = None
             try:
-                req = session.get(url, headers=headers, stream=True, timeout=_DOWNLOAD_TIMEOUT)
-                req.raise_for_status()
+                edge_routes.pin(host, first_route)
+                try:
+                    req = session.get(url, headers=headers, stream=True, timeout=_timeout(first_route))
+                    req.raise_for_status()
+                except requests.RequestException as e:
+                    if first_route == "dns":
+                        raise
+                    # The picked route failed (e.g. a 403 from an IP not serving this site): use the normal route
+                    print(f"Route {first_route} failed ({e.__class__.__name__}), using the normal route")
+                    if req is not None:
+                        req.close()
+                        req = None
+                    session.close()
+                    session = create_http_session()
+                    edge_routes.unpin()
+                    failed_routes.add(first_route)
+                    first_route = "dns"
+                    req = session.get(url, headers=headers, stream=True, timeout=_DOWNLOAD_TIMEOUT)
+                    req.raise_for_status()
             except Exception as e:
                 if req is not None:
                     req.close()
@@ -73,7 +120,10 @@ class DownloadBaseThread(QThread):
                 if raise_errors:
                     raise
                 return ""
+            finally:
+                edge_routes.unpin()
 
+            edge_routes.saw(req.headers.get('X-Edge-Seen'))
             if req.status_code == 304:
                 req.close()
                 print(f"Already up to date: {os.path.basename(cached_path)}")
@@ -88,15 +138,35 @@ class DownloadBaseThread(QThread):
 
             # One worker per MB, capped, and only when the server claims to serve byte ranges
             if supports_ranges and total_size >= _PARALLEL_THRESHOLD:
-                num_workers = min(total_size // (1024 * 1024), 6)
+                num_workers = min(total_size // (1024 * 1024), _MAX_WORKERS)
             else:
                 num_workers = 1
-            return self.download_queued(session, req, url, file_path, total_size, num_workers, raise_errors, atomic,
-                                        resumable=supports_ranges and total_size > 0)
+            return self.download_queued(
+                session, req, url, file_path, total_size, num_workers, raise_errors, atomic,
+                resumable=supports_ranges and total_size > 0, plan=plan, first_route=first_route, failed_routes=failed_routes,
+                etag=_etag(req)
+            )
+        finally:
+            session.close()
 
-    def download_queued(self, session, initial_req, url, file_path, total_size, num_workers, raise_errors=False, atomic=False, resumable=False):
-        total_units = min(total_size // (1024 * 1024), 24) if num_workers > 1 else 1
+    def download_queued(
+        self, session, initial_req, url, file_path, total_size, num_workers, raise_errors=False, atomic=False,
+        resumable=False, plan=None, first_route="dns", failed_routes=(), etag=""
+    ):
+        total_units = min(total_size // (1024 * 1024), _MAX_UNITS) if num_workers > 1 else 1
         print(f"[Queue] starting: {total_units} units, {num_workers} workers, {total_size / (1024 * 1024):.1f} MB", flush=True)
+
+        # Starting route per worker: one explore worker (two from 6 MB), the rest spread over the main routes
+        host = urlparse(url).hostname
+        if plan and num_workers > 1:
+            explore = plan["explore"][:2 if num_workers >= 6 else 1]
+            routes = [("e", r) for r in explore]
+            routes += [("x", plan["exploit"][i % len(plan["exploit"])]) for i in range(num_workers - len(explore))]
+        else:
+            routes = [("x", first_route)] * num_workers
+        fallback = (plan["exploit"] if plan else []) + ["dns"]
+        recorder = edge_routes.RouteRecorder() if plan else None
+        started = time.monotonic()
 
         # Split the file into byte ranges workers pull from. A single stream is one range covering the whole file
         # when the server serves ranges, so a dropped connection resumes where it stopped instead of starting over.
@@ -136,14 +206,77 @@ class DownloadBaseThread(QThread):
         MAX_FAILURES = total_units + 10
         stop_event = threading.Event()
         downloaded_lock = threading.Lock()
+        range_ended = threading.Condition(downloaded_lock)  # wakes workers waiting at the end
         last_emit = [0.0]
         EMIT_INTERVAL = 0.05
 
         # The initial response is good for one read, so a retry has to ask for the file again
         first_stream = [initial_req]
 
-        def open_full_stream():
-            resp = session.get(url, headers=self.headers, stream=True, timeout=_DOWNLOAD_TIMEOUT)
+        # Guarded by downloaded_lock
+        route_failures = {}
+        dead_routes = set(failed_routes)  # skips a route the first request failed on
+        inflight = {}  # worker id -> {"left", "done", "started", "handoff": None or the taker's slot}
+
+        def request_handoff(speed):
+            """(range, slot) of the slowest range still running if this idle worker is at least twice as fast, else
+            None. On a line that is slow everywhere nobody is, so ranges stay where they are."""
+            now = time.monotonic()
+            with downloaded_lock:
+                slowest, slowest_eta = None, 0.0
+                for info in inflight.values():
+                    if info["handoff"] or info["left"] < _STEAL_MIN_BYTES or now - info["started"] < 1.0:
+                        continue
+                    rate = info["done"] / (now - info["started"])
+                    eta = info["left"] / max(rate, 1.0)
+                    if rate * 2 < speed and eta > slowest_eta:
+                        slowest, slowest_eta = info, eta
+                if slowest is None:
+                    return None
+                slowest["handoff"] = queue.Queue(maxsize=1)
+                return slowest, slowest["handoff"]
+
+        def take_over(target, slot):
+            """The rest of target's range, put in slot at its next piece; None if it finished first."""
+            while not stop_event.is_set():
+                try:
+                    return slot.get(timeout=0.5)
+                except queue.Empty:
+                    with downloaded_lock:
+                        if not any(info is target for info in inflight.values()):
+                            break
+            try:
+                return slot.get_nowait()  # handed over just before it finished
+            except queue.Empty:
+                return None
+
+        def next_unit_at_end(speed):
+            """Once the queue is empty: a unit a failure put back, or the rest of a range much slower than this
+            worker. None once nothing is left running."""
+            while not stop_event.is_set():
+                try:
+                    return unit_queue.get_nowait()
+                except queue.Empty:
+                    pass
+                handoff = request_handoff(speed) if speed else None
+                if handoff:
+                    unit = take_over(*handoff)
+                    if unit is not None:
+                        return unit
+                    continue
+                with range_ended:
+                    if not inflight and unit_queue.empty():
+                        return None
+                    range_ended.wait(0.5)  # ranges become worth taking over after a second
+            return None
+
+        def replacement(route):
+            """First working main route other than route, else the normal route."""
+            with downloaded_lock:
+                return next((r for r in fallback if r not in dead_routes and r != route), "dns")
+
+        def open_full_stream(session, route):
+            resp = session.get(url, headers=self.headers, stream=True, timeout=_timeout(route))
             try:
                 resp.raise_for_status()
             except Exception:
@@ -172,26 +305,48 @@ class DownloadBaseThread(QThread):
 
         emit_progress()
 
-        def worker():
+        def worker(worker_id):
+            kind, route = routes[worker_id]
+            # Own session per worker, so pinned connections aren't shared across routes
+            wsession = create_http_session(pinned=route != "dns")
+            edge_routes.pin(host, route)
             f = open(write_path, 'r+b')
+            measured = False  # an explore route gets at least one range, even in a small download
+            speed = 0.0  # of this worker's last finished range
             try:
                 # Workers race for units rather than owning a fixed share, so a slow one holds nobody up.
                 # Each keeps its connection alive across units, so it stays warmed up instead of restarting slowly.
                 while not stop_event.is_set():
+                    with downloaded_lock:
+                        route_dead = route in dead_routes
+                    # Leave a dead route, or an explore route near the end, and carry on on a main route
+                    if route_dead or (kind == "e" and measured and unit_queue.qsize() <= num_workers):
+                        kind, route = "x", replacement(route if route_dead else None)
+                        wsession.close()
+                        wsession = create_http_session(pinned=route != "dns")
+                        edge_routes.pin(host, route)
                     try:
                         unit_idx, start, end = unit_queue.get_nowait()
                     except queue.Empty:
-                        break
+                        # Nothing left: stay to take over slow ranges, so one slow connection or route can't
+                        # hold the end of the download
+                        unit = next_unit_at_end(speed)
+                        if unit is None:
+                            break
+                        unit_idx, start, end = unit
 
                     bytes_this_unit = 0
+                    retire = False
                     expected_bytes = (end - start + 1) if start is not None else total_size
                     resp = None
+                    unit_started = time.monotonic()
+                    colo, failed = "", False
                     try:
                         # A single stream's first attempt reads the response that started the download
                         if first_stream[0] is not None:
                             resp, first_stream[0] = first_stream[0], None
                         elif start is not None:
-                            resp = session.get(url, headers={**self.headers, 'Range': f'bytes={start}-{end}'}, stream=True, timeout=_DOWNLOAD_TIMEOUT)
+                            resp = wsession.get(url, headers={**self.headers, 'Range': f'bytes={start}-{end}'}, stream=True, timeout=_timeout(route))
                             resp.raise_for_status()
                             # 200 means the range was ignored and the whole file is coming
                             if resp.status_code != 206:
@@ -202,14 +357,26 @@ class DownloadBaseThread(QThread):
                             if content_range != f"bytes {start}-{end}/{total_size}":
                                 abandon_ranges()
                                 raise Exception(f"expected range {start}-{end}/{total_size}, got '{content_range}'")
+                            # Edges can briefly hold different versions of a file, and mixing them would corrupt it
+                            if etag and _etag(resp) not in ("", etag):
+                                with downloaded_lock:
+                                    ranges_ignored[0] = True
+                                    stop_event.set()
+                                raise Exception(f"range {start}-{end} came from another version of the file")
                             with downloaded_lock:
                                 ranges_confirmed[0] = True
                         else:
-                            resp = open_full_stream()
+                            resp = open_full_stream(wsession, route)
+
+                        colo = (resp.headers.get('cf-ray') or '').rpartition('-')[2]
+                        if recorder:
+                            recorder.saw(resp.headers.get('X-Edge-Seen'))
+                        with downloaded_lock:
+                            info = inflight[worker_id] = {"left": expected_bytes, "done": 0, "started": time.monotonic(), "handoff": None}
 
                         # Every unit writes at its own offset, which is why the file is pre-allocated
                         f.seek(start if start is not None else 0)
-                        for piece in resp.iter_content(chunk_size=65536):
+                        for piece in resp.iter_content(chunk_size=_PIECE):
                             if not piece:
                                 continue
                             # Hold each unit to its byte count, so nothing is ever written outside its slice
@@ -221,24 +388,43 @@ class DownloadBaseThread(QThread):
                             bytes_this_unit += len(piece)
                             with downloaded_lock:
                                 total_downloaded[0] += len(piece)
+                                info["left"] = expected_bytes - bytes_this_unit
+                                info["done"] = bytes_this_unit
+                                handoff_slot = info["handoff"]
                                 now = time.monotonic()
                                 if now - last_emit[0] >= EMIT_INTERVAL:  # throttle UI updates
                                     last_emit[0] = now
                                     emit_progress()
+                            if handoff_slot is not None and start is not None and bytes_this_unit < expected_bytes:
+                                raise _Handoff()
 
                         # A short slice would otherwise leave a silent hole in the file
                         if expected_bytes and bytes_this_unit != expected_bytes:
                             raise Exception(f"unit {unit_idx} got {bytes_this_unit} of {expected_bytes} bytes")
                         with downloaded_lock:
                             completed_units[0] += 1
+                        speed = bytes_this_unit / max(time.monotonic() - unit_started, 0.001)
+
+                    except _Handoff:
+                        # Not a failure: the faster worker that asked takes the rest, and this one bows out
+                        handoff_slot.put((unit_idx, start + bytes_this_unit, end))
+                        retire = True
 
                     except Exception as e:
+                        failed = True
                         with downloaded_lock:
                             if start is None:
                                 total_downloaded[0] -= bytes_this_unit  # uncount it, the stream is redone from the start
-                            total_failures[0] += 1
+                            # A picked route failing without data is dropped below, so it doesn't use up the download's tries
+                            if route == "dns" or bytes_this_unit:
+                                total_failures[0] += 1
                             last_error[0] = e
                             failures = total_failures[0]
+                            # Drop a picked route after two failures with no data, an optional explore route after one
+                            if route != "dns" and bytes_this_unit == 0:
+                                route_failures[route] = route_failures.get(route, 0) + 1
+                                if route_failures[route] >= (1 if kind == "e" else 2):
+                                    dead_routes.add(route)
                         # A range resumes where it stopped, since the bytes it already wrote stay in place
                         if start is not None:
                             start += bytes_this_unit
@@ -256,18 +442,31 @@ class DownloadBaseThread(QThread):
                     finally:
                         if resp is not None:
                             resp.close()
+                        with range_ended:
+                            inflight.pop(worker_id, None)
+                            range_ended.notify_all()
+                        measured = measured or bytes_this_unit > 0
+                        if recorder:
+                            recorder.add(route, kind, colo, bytes_this_unit, time.monotonic() - unit_started, failed)
+                    if retire:
+                        break
             finally:
                 f.close()
+                wsession.close()
+                edge_routes.unpin()
 
         with ThreadPoolExecutor(max_workers=num_workers) as executor:
-            for _ in range(num_workers):
-                executor.submit(worker)
+            for worker_id in range(num_workers):
+                executor.submit(worker, worker_id)
 
-        # Ranges were advertised but not honoured, so redo the whole thing in one stream
+        # Ranges weren't honoured or came from different versions of the file, so redo the whole thing in one stream
         if ranges_ignored[0]:
-            print("[Queue] server ignored range requests, retrying as a single stream", flush=True)
+            print("[Queue] ranges unusable, retrying as a single stream", flush=True)
             discard_partial()
-            return self.download_queued(session, None, url, file_path, total_size, 1, raise_errors, atomic)
+            return self.download_queued(
+                session, None, url, file_path, total_size, 1, raise_errors, atomic,
+                plan=plan, first_route=first_route, failed_routes=dead_routes, etag=etag
+            )
 
         if stop_event.is_set() or completed_units[0] < total_units:
             print(f"[Queue] download failed: {total_failures[0]} total failures", flush=True)
@@ -316,6 +515,8 @@ class DownloadBaseThread(QThread):
                 return ""
 
         emit_progress()
+        if recorder:
+            recorder.finish(total_size, time.monotonic() - started)
         self.downloaded_file_path = file_path
         return file_path
 
@@ -346,12 +547,23 @@ class DownloadBaseThread(QThread):
         params = {
             'filePath': file_path_on_s3
         }
+        # Pending speed reports ride along, kept until the server accepts them
+        report_batch, report_param = edge_routes.take_reports()
+        if report_param:
+            params['edgeReport'] = report_param
+        region = edge_routes.region()
+        if region:
+            params['edgeRegion'] = region
 
         try:
             response = signed_get(SIGNED_URL_DOWNLOAD_ENDPOINT, params, API_TIMEOUT)
             response.raise_for_status()
+            if report_batch:
+                edge_routes.ack(report_batch)
+                report_batch = None
 
             data = response.json()
+            edge_routes.update(data.get('edges'))
             signed_url = data.get('signedUrl')
             if signed_url:
                 return signed_url
@@ -363,6 +575,9 @@ class DownloadBaseThread(QThread):
             print(f"Error retrieving signed URL: {str(e)}")
             if raise_errors:
                 raise
+        finally:
+            if report_batch:
+                edge_routes.restore(report_batch)
         return None
 
     @staticmethod

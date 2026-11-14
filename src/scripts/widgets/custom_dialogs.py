@@ -201,6 +201,11 @@ class SettingsDialog(QDialog):
         self.sortByOriginCheckbox.setChecked(settings["sortByOrigin"])
         settingsWidgetsLayout.addWidget(self.sortByOriginCheckbox)
 
+        # Optimize download routes
+        self.optimizeRoutesCheckbox = QCheckBox(tr("Optimize download routes"))
+        self.optimizeRoutesCheckbox.setChecked(settings["optimizeDownloadRoutes"])
+        settingsWidgetsLayout.addWidget(self.optimizeRoutesCheckbox)
+
         # Apply button
         applyButtonLayout = QHBoxLayout()
         applyButtonLayout.setContentsMargins(0, 0, 10, 10)
@@ -240,6 +245,7 @@ class SettingsDialog(QDialog):
         settings["sortByOrigin"] = self.sortByOriginCheckbox.isChecked()
         settings["checkAppUpdate"] = self.checkAppUpdateCheckbox.isChecked()
         settings["launchAppOnStartup"] = self.launchAppOnStarupCheckbox.isChecked()
+        settings["optimizeDownloadRoutes"] = self.optimizeRoutesCheckbox.isChecked()
         apply_settings(settings)
 
         if sys.argv[0].endswith('.exe'):

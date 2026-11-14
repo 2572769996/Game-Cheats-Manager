@@ -187,8 +187,7 @@ class DownloadTrainersThread(DownloadBaseThread):
             elif os.path.lexists(path):
                 os.remove(path)
 
-        if (os.path.lexists(trainer_directory)
-                and (not os.path.isdir(trainer_directory) or os.path.islink(trainer_directory))):
+        if os.path.lexists(trainer_directory) and (not os.path.isdir(trainer_directory) or os.path.islink(trainer_directory)):
             remove_entry(trainer_directory)
         os.makedirs(trainer_directory, exist_ok=True)
 
@@ -890,8 +889,10 @@ class DownloadTrainersThread(DownloadBaseThread):
                 {'search': "E8????????833D????????000F84????????BA2E040000", 'replace': "??????????90909090909090909090909090??????????"},
                 {'search': "8D4A??E8????????833D????????000F84????????", 'replace': "????????????????90909090909090909090909090"}
             ]
-        elif game_name in ["GuLong", "Palworld", "Baldur's Gate 3", "Starfield", "Hogwarts Legacy", "Sword and Fairy 7", "Path Of Wuxia", "Elden Ring",
-                           "Fate Seeker II", "Final Fantasy VII Remake Intergrade"]:
+        elif game_name in [
+            "GuLong", "Palworld", "Baldur's Gate 3", "Starfield", "Hogwarts Legacy", "Sword and Fairy 7", "Path Of Wuxia", "Elden Ring",
+            "Fate Seeker II", "Final Fantasy VII Remake Intergrade"
+        ]:
             patches_to_apply = [
                 {'search': "8B??E8??????00833D??????00000F84????0000", 'replace': "8B??E8??????00833D??????0000909090909090"},
                 {'search': "833D??????00000F84????????833D????????000F84????????", 'replace': "833D??????0000909090909090833D????????00909090909090"}

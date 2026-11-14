@@ -111,6 +111,7 @@ def load_settings():
         "launchAppOnStartup": False,
         "showWarning": True,
         "lastSeenAnnouncementId": "",
+        "optimizeDownloadRoutes": True,
 
         # Trainer management configs
         "enableGCM": True,

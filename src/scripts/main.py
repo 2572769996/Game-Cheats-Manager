@@ -18,6 +18,7 @@ from tendo import singleton
 from PyQt6.QtSvg import QSvgRenderer
 from PyQt6.QtSvgWidgets import QSvgWidget
 
+import edge_routes
 import style_sheet
 from config import *
 from widgets.custom_dialogs import AboutDialog, AnnouncementDialog, CopyRightWarning, SettingsDialog, TrainerUploadDialog
@@ -313,8 +314,14 @@ class GameCheatsManager(QMainWindow):
     def launch_updater(self, s3_path, signed_url):
         try:
             pid = str(os.getpid())
-            params = (f'--pid {pid} --s3-path "{s3_path}" --url "{signed_url}"'
-                      f' --theme {settings["theme"]} --language {settings["language"]}')
+            params = (
+                f'--pid {pid} --s3-path "{s3_path}" --url "{signed_url}"'
+                f' --theme {settings["theme"]} --language {settings["language"]}'
+            )
+            # Server-picked routes (China only)
+            plan = edge_routes.plan_for(signed_url)
+            if plan:
+                params += f' --routes {",".join(plan["exploit"])}'
             result = ctypes.windll.shell32.ShellExecuteW(0, "runas", updater_path, params, None, 1)
             if result <= 32:
                 raise OSError(f"ShellExecuteW failed with code {result}")

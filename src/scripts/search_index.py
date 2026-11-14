@@ -159,8 +159,7 @@ class QueryMatcher:
                     return True
             elif self.pinyin_q:                                 # homophone / romanized
                 tp = pinyin_forms(target)[0]
-                if tp and (self.pinyin_q in tp
-                           or fuzz.partial_ratio(self.pinyin_q, tp) >= PINYIN_THRESHOLD):
+                if tp and (self.pinyin_q in tp or fuzz.partial_ratio(self.pinyin_q, tp) >= PINYIN_THRESHOLD):
                     return True
         return False
 

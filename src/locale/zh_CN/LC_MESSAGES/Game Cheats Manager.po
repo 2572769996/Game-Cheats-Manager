@@ -452,6 +452,9 @@ msgstr "始终以英文显示搜索结果"
 msgid "Sort search results by origin"
 msgstr "按修改器来源排序"
 
+msgid "Optimize download routes"
+msgstr "优化下载线路"
+
 msgid "Apply"
 msgstr "应用"
 

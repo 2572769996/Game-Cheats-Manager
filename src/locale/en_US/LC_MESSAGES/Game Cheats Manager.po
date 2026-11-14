@@ -452,6 +452,9 @@ msgstr "Always show search results in English"
 msgid "Sort search results by origin"
 msgstr "Sort search results by origin"
 
+msgid "Optimize download routes"
+msgstr "Optimize download routes"
+
 msgid "Apply"
 msgstr "Apply"
 
